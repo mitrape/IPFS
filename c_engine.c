@@ -182,6 +182,42 @@ static void make_block_path(const char *hash_hex, char out[PATH_MAX]) {
     char d2[3] = { hash_hex[2], hash_hex[3], '\0' };
     snprintf(out, PATH_MAX, "%s/%s/%s/%s.bin", BLOCKS_DIR, d1, d2, hash_hex);
 }
+// مسیر فایل refcount برای هر بلاک: ipfs_store/blocks/aa/bb/<hash>.ref
+static void make_refcount_path(const char *hash_hex, char out[PATH_MAX]) {
+    char d1[3] = { hash_hex[0], hash_hex[1], '\0' };
+    char d2[3] = { hash_hex[2], hash_hex[3], '\0' };
+    snprintf(out, PATH_MAX, "%s/%s/%s/%s.ref", BLOCKS_DIR, d1, d2, hash_hex);
+}
+
+// افزایش refcount برای بلاک با این hash
+static void inc_refcount(const char *hash_hex) {
+    char refpath[PATH_MAX];
+    make_refcount_path(hash_hex, refpath);
+
+    // اگر دایرکتوری‌ها هنوز ساخته نشده‌اند، بساز
+    if (ensure_parents_for_path(refpath) < 0) {
+        fprintf(stderr, "inc_refcount: ensure_parents_for_path failed\n");
+        return;
+    }
+
+    int cnt = 0;
+    FILE *f = fopen(refpath, "r");
+    if (f) {
+        if (fscanf(f, "%d", &cnt) != 1) {
+            // اگر چیزی نخوند، فرض می‌کنیم صفر بود
+            cnt = 0;
+        }
+        fclose(f);
+    }
+
+    f = fopen(refpath, "w");
+    if (!f) {
+        perror("fopen refcount");
+        return;
+    }
+    fprintf(f, "%d\n", cnt + 1);
+    fclose(f);
+}
 
 static void make_manifest_path(const char *cid, char out[PATH_MAX]) {
     snprintf(out, PATH_MAX, "%s/%s.json", MANIFESTS_DIR, cid);
@@ -336,18 +372,24 @@ static void process_upload_task(Task *t) {
     char path[PATH_MAX];
     make_block_path(hash_hex, path);
 
-    // If file already exists, we do not rewrite (simple dedup).
-    // (Refcounting could be added on top of this).
+    // چک کن بلاک از قبل وجود دارد یا نه
+    int existed = 0;
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         // already exists
+        existed = 1;
         close(fd);
     } else {
+        // اگر وجود نداشت، فایل بلاک را اتمیک بنویس
         if (write_file_atomic(path, data, len) < 0) {
             fprintf(stderr, "Failed to write block %s\n", path);
-            // fall through; at least manifest will still reference the hash
+            // حتی اگر نوشتن بلاک fail شود، هنوز هم می‌توانیم manifest بسازیم،
+            // ولی در عمل بهتر است بعداً این را به ERROR تبدیل کنیم.
         }
     }
+
+    // در هر دو حالت، refcount را زیاد کن
+    inc_refcount(hash_hex);
 
     // Store chunk metadata in UploadState
     pthread_mutex_lock(&st->mu);
@@ -378,6 +420,7 @@ static void process_upload_task(Task *t) {
 
     free(data);  // chunk buffer owned by task
 }
+
 
 /* -------- download task processing -------- */
 
