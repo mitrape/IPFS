@@ -453,7 +453,397 @@ static void* worker_main(void *arg) {
     }
     return NULL;
 }
+/* ==================== Manifest building/parsing ==================== */
 
+static int build_manifest_json(const UploadState *st,
+                               char **out_buf, size_t *out_len,
+                               char cid_hex_out[65]) {
+    char *buf = NULL;
+    size_t len = 0;
+
+    FILE *mf = open_memstream(&buf, &len);
+    if (!mf) {
+        perror("open_memstream");
+        return -1;
+    }
+
+    pthread_mutex_lock((pthread_mutex_t *)&st->mu); // const-cast for read
+    uint32_t total_chunks = st->total_chunks;
+    uint64_t total_size   = st->total_size;
+
+    fprintf(mf, "{\"version\":1");
+    fprintf(mf, ",\"hash_algo\":\"blake3\"");
+    fprintf(mf, ",\"chunk_size\":%u", (unsigned)DEFAULT_CHUNK_SIZE);
+    fprintf(mf, ",\"total_size\":%" PRIu64, total_size);
+    fprintf(mf, ",\"filename\":\"%s\"", st->filename ? st->filename : "");
+    fprintf(mf, ",\"chunks\":[");
+
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        const ChunkMeta *cm = &st->chunks[i];
+        fprintf(mf,
+                "{\"index\":%u,\"size\":%u,\"hash\":\"%s\"}%s",
+                cm->index, cm->size, cm->hash,
+                (i + 1 < total_chunks) ? "," : "");
+    }
+    fprintf(mf, "]}");
+    pthread_mutex_unlock((pthread_mutex_t *)&st->mu);
+
+    fflush(mf);
+    fclose(mf);
+
+    blake3_hex((const uint8_t*)buf, len, cid_hex_out);
+
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
+}
+
+typedef struct {
+    size_t n_chunks;
+    ChunkMeta *chunks;   // only hash+index used
+} ManifestChunks;
+
+static void manifest_chunks_free(ManifestChunks *m) {
+    if (!m) return;
+    free(m->chunks);
+    m->chunks = NULL;
+    m->n_chunks = 0;
+}
+
+// Very shallow parser for our own manifest format
+static int load_manifest_chunks(const char *cid, ManifestChunks *out) {
+    char path[PATH_MAX];
+    make_manifest_path(cid, path);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open manifest");
+        return -1;
+    }
+
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size < 0) { perror("lseek"); close(fd); return -1; }
+    if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek"); close(fd); return -1; }
+
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { perror("malloc manifest"); close(fd); return -1; }
+
+    if (read_n(fd, buf, (size_t)size) != size) {
+        perror("read manifest");
+        close(fd);
+        free(buf);
+        return -1;
+    }
+    close(fd);
+    buf[size] = '\0';
+
+    const char *needle = "\"hash\":\"";
+    char *p = buf;
+    ChunkMeta *chunks = NULL;
+    size_t cap = 0, len_chunks = 0;
+
+    while ((p = strstr(p, needle)) != NULL) {
+        p += strlen(needle);
+        char *end = strchr(p, '\"');
+        if (!end) break;
+        size_t hlen = (size_t)(end - p);
+        if (hlen >= 64) hlen = 64;
+
+        if (len_chunks == cap) {
+            size_t new_cap = cap ? cap * 2 : 16;
+            ChunkMeta *n = realloc(chunks, new_cap * sizeof(ChunkMeta));
+            if (!n) {
+                perror("realloc manifest chunks");
+                free(chunks);
+                free(buf);
+                return -1;
+            }
+            chunks = n;
+            cap = new_cap;
+        }
+
+        ChunkMeta *cm = &chunks[len_chunks];
+        cm->index = (uint32_t)len_chunks;
+        cm->size  = 0;
+        memset(cm->hash, 0, sizeof(cm->hash));
+        memcpy(cm->hash, p, hlen);
+        cm->hash[hlen] = '\0';
+
+        len_chunks++;
+        p = end + 1;
+    }
+
+    free(buf);
+
+    out->n_chunks = len_chunks;
+    out->chunks   = chunks;
+    return 0;
+}
+
+/* ==================== Connection handler ==================== */
+
+static int queue_upload_chunk(UploadState *st, uint8_t *data, uint32_t len) {
+    Task *t = (Task*)calloc(1, sizeof(Task));
+    if (!t) {
+        perror("calloc task");
+        return -1;
+    }
+    t->type = TASK_UPLOAD;
+    t->u.upload.st   = st;
+    t->u.upload.data = data;
+    t->u.upload.size = len;
+
+    pthread_mutex_lock(&st->mu);
+    uint32_t index = st->next_index++;
+    st->total_chunks = st->next_index;
+    st->total_size  += len;
+    st->pending_tasks++;
+    pthread_mutex_unlock(&st->mu);
+
+    t->u.upload.index = index;
+
+    enqueue_task(t);
+    return 0;
+}
+
+static void handle_connection(int cfd) {
+    UploadState up;
+    upload_state_construct(&up);
+
+    for (;;) {
+        uint8_t header[5];
+        ssize_t r = read_n(cfd, header, 5);
+        if (r == 0) break;
+        if (r < 0) break;
+
+        uint8_t op = header[0];
+        uint32_t len;
+        memcpy(&len, header + 1, 4);
+        len = ntohl(len);
+
+        uint8_t *payload = NULL;
+        if (len) {
+            payload = (uint8_t*)malloc(len);
+            if (!payload) { perror("malloc"); break; }
+            if (read_n(cfd, payload, len) <= 0) {
+                free(payload);
+                break;
+            }
+        }
+
+        int free_payload = 1;
+
+        if (op == OP_UPLOAD_START) {
+            printf("[ENGINE] UPLOAD_START: name=\"%.*s\"\n",
+                   (int)len, (char*)payload);
+            fflush(stdout);
+
+            upload_state_reset(&up);
+            pthread_mutex_lock(&up.mu);
+            up.active = 1;
+            up.filename = (char*)malloc(len + 1);
+            if (!up.filename) {
+                perror("malloc filename");
+                pthread_mutex_unlock(&up.mu);
+                free(payload);
+                break;
+            }
+            memcpy(up.filename, payload, len);
+            up.filename[len] = '\0';
+            pthread_mutex_unlock(&up.mu);
+
+        } else if (op == OP_UPLOAD_CHUNK) {
+            if (!up.active) {
+                fprintf(stderr, "UPLOAD_CHUNK without UPLOAD_START\n");
+            } else {
+                if (queue_upload_chunk(&up, payload, len) < 0) {
+                    fprintf(stderr, "Failed to queue upload chunk\n");
+                    free(payload);
+                    break;
+                }
+                free_payload = 0; // task owns payload
+            }
+
+        } else if (op == OP_UPLOAD_FINISH) {
+            printf("[ENGINE] UPLOAD_FINISH\n");
+            fflush(stdout);
+
+            // wait for all chunk tasks to finish
+            pthread_mutex_lock(&up.mu);
+            while (up.pending_tasks > 0) {
+                pthread_cond_wait(&up.cv, &up.mu);
+            }
+            up.active = 0;
+            pthread_mutex_unlock(&up.mu);
+
+            char *manifest = NULL;
+            size_t manifest_len = 0;
+            char cid[65];
+
+            if (build_manifest_json(&up, &manifest, &manifest_len, cid) < 0) {
+                fprintf(stderr, "Failed to build manifest\n");
+                free(payload);
+                break;
+            }
+
+            char manifest_path[PATH_MAX];
+            make_manifest_path(cid, manifest_path);
+
+            if (write_file_atomic(manifest_path, manifest, manifest_len) < 0) {
+                fprintf(stderr, "Failed to write manifest %s\n", manifest_path);
+                free(manifest);
+                free(payload);
+                break;
+            }
+            free(manifest);
+
+            printf("[ENGINE] UPLOAD_FINISH -> CID %s\n", cid);
+            fflush(stdout);
+
+            send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+
+            upload_state_reset(&up);
+
+        } else if (op == OP_DOWNLOAD_START) {
+            char *cid = (char*)malloc(len + 1);
+            if (!cid) {
+                perror("malloc cid");
+                free(payload);
+                break;
+            }
+            memcpy(cid, payload, len);
+            cid[len] = '\0';
+
+            printf("[ENGINE] DOWNLOAD_START: cid=\"%s\"\n", cid);
+            fflush(stdout);
+
+            ManifestChunks m;
+            m.n_chunks = 0;
+            m.chunks   = NULL;
+
+            if (load_manifest_chunks(cid, &m) < 0) {
+                fprintf(stderr, "Failed to load manifest for cid %s\n", cid);
+                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                free(cid);
+                free(payload);
+                break;
+            }
+
+            DownloadState ds;
+            download_state_construct(&ds, m.n_chunks);
+
+            // create tasks for each chunk
+            for (size_t i = 0; i < m.n_chunks; i++) {
+                Task *t = (Task*)calloc(1, sizeof(Task));
+                if (!t) {
+                    perror("calloc download task");
+                    continue;
+                }
+                t->type = TASK_DOWNLOAD;
+                t->u.download.st    = &ds;
+                t->u.download.index = (uint32_t)i;
+                strncpy(t->u.download.hash, m.chunks[i].hash,
+                        sizeof(t->u.download.hash));
+                t->u.download.hash[sizeof(t->u.download.hash) - 1] = '\0';
+
+                enqueue_task(t);
+            }
+
+            // sequential merger: wait index by index
+            for (size_t i = 0; i < m.n_chunks; i++) {
+                pthread_mutex_lock(&ds.mu);
+                while (!ds.slots[i].ready) {
+                    pthread_cond_wait(&ds.cv, &ds.mu);
+                }
+                int err = ds.slots[i].error;
+                uint8_t *data = ds.slots[i].data;
+                uint32_t sz   = ds.slots[i].size;
+                pthread_mutex_unlock(&ds.mu);
+
+                if (err || !data) {
+                    fprintf(stderr,
+                            "Error in download chunk %zu for cid %s\n", i, cid);
+                    break;
+                }
+
+                if (send_frame(cfd, OP_DOWNLOAD_CHUNK, data, sz) < 0) {
+                    fprintf(stderr, "send_frame DOWNLOAD_CHUNK failed\n");
+                    break;
+                }
+
+                free(data);
+                ds.slots[i].data = NULL;
+            }
+
+            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+
+            download_state_destroy(&ds);
+            manifest_chunks_free(&m);
+            free(cid);
+
+        } else {
+            fprintf(stderr, "Unknown opcode: 0x%02x\n", op);
+        }
+
+        if (free_payload && payload) free(payload);
+    }
+
+    upload_state_destroy(&up);
+    close(cfd);
+}
+
+/* ==================== main ==================== */
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s /tmp/cengine.sock\n", argv[0]);
+        return 2;
+    }
+    g_sock_path = argv[1];
+
+    if (ensure_dir(STORAGE_ROOT) < 0) return 1;
+    if (ensure_dir(BLOCKS_DIR) < 0) return 1;
+    if (ensure_dir(MANIFESTS_DIR) < 0) return 1;
+
+    // start global thread pool
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pthread_t th;
+        pthread_create(&th, NULL, worker_main, NULL);
+        pthread_detach(th);
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) die("socket");
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, g_sock_path, sizeof(addr.sun_path) - 1);
+
+    unlink(g_sock_path);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) die("bind");
+    if (listen(fd, 64) < 0) die("listen");
+
+    printf("[ENGINE] listening on %s\n", g_sock_path);
+    fflush(stdout);
+
+    for (;;) {
+        int cfd = accept(fd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            break;
+        }
+        pthread_t th;
+        pthread_create(&th, NULL, (void*(*)(void*))handle_connection,
+                       (void*)(intptr_t)cfd);
+        pthread_detach(th);
+    }
+
+    close(fd);
+    unlink(g_sock_path);
+    return 0;
+}
 
 
 
