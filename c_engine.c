@@ -40,7 +40,7 @@
 #define STORAGE_ROOT      "ipfs_store"
 #define BLOCKS_DIR        STORAGE_ROOT "/blocks"
 #define MANIFESTS_DIR     STORAGE_ROOT "/manifests"
-
+#define OP_ERROR 0xFF
 #define DEFAULT_CHUNK_SIZE (256 * 1024)
 
 #define NUM_WORKERS 4
@@ -91,6 +91,14 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
     if (write_all(fd, header, 5) < 0) return -1;
     if (len && write_all(fd, payload, len) < 0) return -1;
     return 0;
+}
+
+/* send error*/
+static void send_error(int fd, const char *code, const char *msg) {
+    char buf[256];
+    int n = snprintf(buf,sizeof(buf),
+            "{\"code\":\"%s\",\"message\":\"%s\"}", code, msg);
+    send_frame(fd, OP_ERROR, buf, n);
 }
 
 /* ==================== FS helpers ==================== */
@@ -412,18 +420,22 @@ static void process_download_task(Task *t) {
     // Verify hash
     char verify[65];
     blake3_hex(buf, (size_t)sz, verify);
-    int err = (strcmp(verify, hash_hex) != 0);
+    int mismatch = (strcmp(verify, hash_hex) != 0);
 
     pthread_mutex_lock(&ds->mu);
     if (index < ds->n_chunks) {
         ds->slots[index].ready = 1;
-        ds->slots[index].error = err;
-        if (!err) {
+        if (mismatch) {
+            ds->slots[index].error = 2;  // 2 = HASH_MISMATCH
+        } else {
+            ds->slots[index].error = 0;
             ds->slots[index].data = buf;
             ds->slots[index].size = (uint32_t)sz;
             buf = NULL; // ownership moved
         }
     }
+    pthread_cond_broadcast(&ds->cv);
+    pthread_mutex_unlock(&ds->mu);
     pthread_cond_broadcast(&ds->cv);
     pthread_mutex_unlock(&ds->mu);
 
@@ -653,16 +665,18 @@ static void handle_connection(int cfd) {
             pthread_mutex_unlock(&up.mu);
 
         } else if (op == OP_UPLOAD_CHUNK) {
-            if (!up.active) {
-                fprintf(stderr, "UPLOAD_CHUNK without UPLOAD_START\n");
-            } else {
-                if (queue_upload_chunk(&up, payload, len) < 0) {
-                    fprintf(stderr, "Failed to queue upload chunk\n");
-                    free(payload);
-                    break;
-                }
-                free_payload = 0; // task owns payload
-            }
+    if (!up.active) {
+        fprintf(stderr, "UPLOAD_CHUNK بدون UPLOAD_START\n");
+        send_error(cfd, "E_PROTO", "UPLOAD_CHUNK before UPLOAD_START");
+    } else {
+        if (queue_upload_chunk(&up, payload, len) < 0) {
+            fprintf(stderr, "Failed to queue upload chunk\n");
+            send_error(cfd, "E_BUSY", "cannot queue upload chunk");
+            free(payload);
+            break;
+        }
+        free_payload = 0; // task owns payload
+    }
 
         } else if (op == OP_UPLOAD_FINISH) {
             printf("[ENGINE] UPLOAD_FINISH\n");
@@ -721,9 +735,9 @@ static void handle_connection(int cfd) {
             m.n_chunks = 0;
             m.chunks   = NULL;
 
-            if (load_manifest_chunks(cid, &m) < 0) {
+            if (load_manifest_chunks(cid, &m) < 0 || m.n_chunks == 0) {
                 fprintf(stderr, "Failed to load manifest for cid %s\n", cid);
-                send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+                send_error(cfd, "E_NOT_FOUND", "manifest not found");
                 free(cid);
                 free(payload);
                 break;
@@ -749,33 +763,49 @@ static void handle_connection(int cfd) {
                 enqueue_task(t);
             }
 
-            // sequential merger: wait index by index
-            for (size_t i = 0; i < m.n_chunks; i++) {
-                pthread_mutex_lock(&ds.mu);
-                while (!ds.slots[i].ready) {
-                    pthread_cond_wait(&ds.cv, &ds.mu);
-                }
-                int err = ds.slots[i].error;
-                uint8_t *data = ds.slots[i].data;
-                uint32_t sz   = ds.slots[i].size;
-                pthread_mutex_unlock(&ds.mu);
+            nt any_error = 0;
 
-                if (err || !data) {
-                    fprintf(stderr,
-                            "Error in download chunk %zu for cid %s\n", i, cid);
-                    break;
-                }
+// sequential merger: wait index by index
+for (size_t i = 0; i < m.n_chunks; i++) {
+    pthread_mutex_lock(&ds.mu);
+    while (!ds.slots[i].ready) {
+        pthread_cond_wait(&ds.cv, &ds.mu);
+    }
+    int err_code    = ds.slots[i].error;
+    uint8_t *data   = ds.slots[i].data;
+    uint32_t sz     = ds.slots[i].size;
+    pthread_mutex_unlock(&ds.mu);
 
-                if (send_frame(cfd, OP_DOWNLOAD_CHUNK, data, sz) < 0) {
-                    fprintf(stderr, "send_frame DOWNLOAD_CHUNK failed\n");
-                    break;
-                }
+    if (err_code != 0 || !data) {
+        any_error = 1;
+        if (err_code == 1) {
+            send_error(cfd, "E_NOT_FOUND", "chunk not found");
+        } else if (err_code == 2) {
+            send_error(cfd, "E_HASH_MISMATCH", "chunk hash mismatch");
+        } else {
+            send_error(cfd, "E_BUSY", "download chunk failed");
+        }
+        fprintf(stderr,
+                "Error in download chunk %zu for cid %s (err=%d)\n",
+                i, cid, err_code);
+        break;
+    }
 
-                free(data);
-                ds.slots[i].data = NULL;
-            }
+    if (send_frame(cfd, OP_DOWNLOAD_CHUNK, data, sz) < 0) {
+        fprintf(stderr, "send_frame DOWNLOAD_CHUNK failed\n");
+        any_error = 1;
+        send_error(cfd, "E_BUSY", "send DOWNLOAD_CHUNK failed");
+        break;
+    }
 
-            send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+    free(data);
+    ds.slots[i].data = NULL;
+}
+
+if (!any_error) {
+    send_frame(cfd, OP_DOWNLOAD_DONE, NULL, 0);
+}
+            
 
             download_state_destroy(&ds);
             manifest_chunks_free(&m);
@@ -783,6 +813,7 @@ static void handle_connection(int cfd) {
 
         } else {
             fprintf(stderr, "Unknown opcode: 0x%02x\n", op);
+            send_error(cfd, "E_PROTO", "unknown opcode");
         }
 
         if (free_payload && payload) free(payload);
