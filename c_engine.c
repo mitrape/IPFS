@@ -438,7 +438,7 @@ static void process_download_task(Task *t) {
         pthread_mutex_lock(&ds->mu);
         if (index < ds->n_chunks) {
             ds->slots[index].ready = 1;
-            ds->slots[index].error = 1;
+            ds->slots[index].error = 1;  // 1 = "chunk not found or I/O error"
         }
         pthread_cond_broadcast(&ds->cv);
         pthread_mutex_unlock(&ds->mu);
@@ -446,16 +446,56 @@ static void process_download_task(Task *t) {
     }
 
     off_t sz = lseek(fd, 0, SEEK_END);
-    if (sz < 0) { perror("lseek"); close(fd); return; }
-    if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek"); close(fd); return; }
+    if (sz < 0) {
+        perror("lseek");
+        close(fd);
+        pthread_mutex_lock(&ds->mu);
+        if (index < ds->n_chunks) {
+            ds->slots[index].ready = 1;
+            ds->slots[index].error = 1;
+        }
+        pthread_cond_broadcast(&ds->cv);
+        pthread_mutex_unlock(&ds->mu);
+        return;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("lseek");
+        close(fd);
+        pthread_mutex_lock(&ds->mu);
+        if (index < ds->n_chunks) {
+            ds->slots[index].ready = 1;
+            ds->slots[index].error = 1;
+        }
+        pthread_cond_broadcast(&ds->cv);
+        pthread_mutex_unlock(&ds->mu);
+        return;
+    }
 
     uint8_t *buf = malloc((size_t)sz);
-    if (!buf) { perror("malloc block"); close(fd); return; }
+    if (!buf) {
+        perror("malloc block");
+        close(fd);
+        pthread_mutex_lock(&ds->mu);
+        if (index < ds->n_chunks) {
+            ds->slots[index].ready = 1;
+            ds->slots[index].error = 1;
+        }
+        pthread_cond_broadcast(&ds->cv);
+        pthread_mutex_unlock(&ds->mu);
+        return;
+    }
 
     if (read_n(fd, buf, (size_t)sz) != sz) {
         perror("read block");
         free(buf);
         close(fd);
+        pthread_mutex_lock(&ds->mu);
+        if (index < ds->n_chunks) {
+            ds->slots[index].ready = 1;
+            ds->slots[index].error = 1;
+        }
+        pthread_cond_broadcast(&ds->cv);
+        pthread_mutex_unlock(&ds->mu);
         return;
     }
     close(fd);
@@ -472,8 +512,8 @@ static void process_download_task(Task *t) {
             ds->slots[index].error = 2;  // 2 = HASH_MISMATCH
         } else {
             ds->slots[index].error = 0;
-            ds->slots[index].data = buf;
-            ds->slots[index].size = (uint32_t)sz;
+            ds->slots[index].data  = buf;
+            ds->slots[index].size  = (uint32_t)sz;
             buf = NULL; // ownership moved
         }
     }
