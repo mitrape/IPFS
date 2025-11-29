@@ -373,7 +373,7 @@ static void process_upload_task(Task *t) {
     make_block_path(hash_hex, path);
 
     // چک کن بلاک از قبل وجود دارد یا نه
-    int existed = 0;
+    
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         // already exists
