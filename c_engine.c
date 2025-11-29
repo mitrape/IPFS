@@ -479,8 +479,6 @@ static void process_download_task(Task *t) {
     }
     pthread_cond_broadcast(&ds->cv);
     pthread_mutex_unlock(&ds->mu);
-    pthread_cond_broadcast(&ds->cv);
-    pthread_mutex_unlock(&ds->mu);
 
     free(buf); // free only if not moved
 }
@@ -722,44 +720,67 @@ static void handle_connection(int cfd) {
     }
 
         } else if (op == OP_UPLOAD_FINISH) {
-            printf("[ENGINE] UPLOAD_FINISH\n");
-            fflush(stdout);
+    printf("[ENGINE] UPLOAD_FINISH\n");
+    fflush(stdout);
 
-            // wait for all chunk tasks to finish
-            pthread_mutex_lock(&up.mu);
-            while (up.pending_tasks > 0) {
-                pthread_cond_wait(&up.cv, &up.mu);
-            }
-            up.active = 0;
-            pthread_mutex_unlock(&up.mu);
+    // صبر کن تا همه‌ی تسک‌های آپلود تموم بشن
+    pthread_mutex_lock(&up.mu);
+    while (up.pending_tasks > 0) {
+        pthread_cond_wait(&up.cv, &up.mu);
+    }
+    up.active = 0;
+    pthread_mutex_unlock(&up.mu);
 
-            char *manifest = NULL;
-            size_t manifest_len = 0;
-            char cid[65];
+    // ✅ کد جدید: چک کن هیچ چانکی جا نیفتاده
+    int missing = 0;
+    pthread_mutex_lock(&up.mu);
+    for (uint32_t i = 0; i < up.total_chunks; i++) {
+        // اگر ظرفیت آرایه به هر دلیل کمتر باشه، یا size صفر باشه → مشکل
+        if (i >= up.chunks_cap || up.chunks[i].size == 0) {
+            missing = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&up.mu);
 
-            if (build_manifest_json(&up, &manifest, &manifest_len, cid) < 0) {
-                fprintf(stderr, "Failed to build manifest\n");
-                free(payload);
-                break;
-            }
+    if (missing) {
+        fprintf(stderr, "UPLOAD_FINISH: missing chunk(s)\n");
+        send_error(cfd, "E_PROTO", "missing chunk in upload");
+        upload_state_reset(&up);
+        // اتصال رو می‌بندیم، از حلقه‌ی اصلی میایم بیرون
+        break;
+    }
 
-            char manifest_path[PATH_MAX];
-            make_manifest_path(cid, manifest_path);
+    // از اینجا به بعد مثل قبل
+    char *manifest = NULL;
+    size_t manifest_len = 0;
+    char cid[65];
 
-            if (write_file_atomic(manifest_path, manifest, manifest_len) < 0) {
-                fprintf(stderr, "Failed to write manifest %s\n", manifest_path);
-                free(manifest);
-                free(payload);
-                break;
-            }
-            free(manifest);
+    if (build_manifest_json(&up, &manifest, &manifest_len, cid) < 0) {
+        fprintf(stderr, "Failed to build manifest\n");
+        send_error(cfd, "E_BUSY", "failed to build manifest");
+        free(payload);
+        break;
+    }
 
-            printf("[ENGINE] UPLOAD_FINISH -> CID %s\n", cid);
-            fflush(stdout);
+    char manifest_path[PATH_MAX];
+    make_manifest_path(cid, manifest_path);
 
-            send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+    if (write_file_atomic(manifest_path, manifest, manifest_len) < 0) {
+        fprintf(stderr, "Failed to write manifest %s\n", manifest_path);
+        send_error(cfd, "E_BUSY", "failed to write manifest");
+        free(manifest);
+        free(payload);
+        break;
+    }
+    free(manifest);
 
-            upload_state_reset(&up);
+    printf("[ENGINE] UPLOAD_FINISH -> CID %s\n", cid);
+    fflush(stdout);
+
+    send_frame(cfd, OP_UPLOAD_DONE, cid, (uint32_t)strlen(cid));
+
+    upload_state_reset(&up);
 
         } else if (op == OP_DOWNLOAD_START) {
             char *cid = (char*)malloc(len + 1);
@@ -804,9 +825,10 @@ static void handle_connection(int cfd) {
                 t->u.download.hash[sizeof(t->u.download.hash) - 1] = '\0';
 
                 enqueue_task(t);
+               
             }
 
-            nt any_error = 0;
+            int any_error = 0;
 
 // sequential merger: wait index by index
 for (size_t i = 0; i < m.n_chunks; i++) {
