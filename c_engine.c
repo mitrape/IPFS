@@ -7,8 +7,10 @@
 //
 // Hash:  BLAKE3 (32 bytes, hex-encoded)
 // Chunk: 256 KiB (must match main.py)
-
 #define _GNU_SOURCE
+#include <semaphore.h>
+#define MAX_CONNECTIONS 64
+static sem_t conn_sem;
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
@@ -24,8 +26,9 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <sys/file.h>
 
-#include "blake3/blake3.h"  // requires libblake3
+#include "blake3/blake3.h"   // requires libblake3
 
 #define OP_UPLOAD_START   0x01
 #define OP_UPLOAD_CHUNK   0x02
@@ -44,6 +47,9 @@
 #define DEFAULT_CHUNK_SIZE (256 * 1024)
 
 #define NUM_WORKERS 4
+
+#define MAX_FRAME (4 * 1024 * 1024)  // 4 MiB safety cap
+#define MAX_NAME_LEN 4096
 
 static const char* g_sock_path = NULL;
 
@@ -197,29 +203,43 @@ static void inc_refcount(const char *hash_hex) {
     char refpath[PATH_MAX];
     make_refcount_path(hash_hex, refpath);
 
-    // اگر دایرکتوری‌ها هنوز ساخته نشده‌اند، بساز
     if (ensure_parents_for_path(refpath) < 0) {
         fprintf(stderr, "inc_refcount: ensure_parents_for_path failed\n");
         return;
     }
 
-    int cnt = 0;
-    FILE *f = fopen(refpath, "r");
-    if (f) {
-        if (fscanf(f, "%d", &cnt) != 1) {
-            // اگر چیزی نخوند، فرض می‌کنیم صفر بود
-            cnt = 0;
-        }
-        fclose(f);
-    }
-
-    f = fopen(refpath, "w");
-    if (!f) {
-        perror("fopen refcount");
+    int fd = open(refpath, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        perror("open refcount");
         return;
     }
-    fprintf(f, "%d\n", cnt + 1);
-    fclose(f);
+
+    if (flock(fd, LOCK_EX) < 0) {
+        perror("flock");
+        close(fd);
+        return;
+    }
+
+    int cnt = 0;
+    char buf[64] = {0};
+    lseek(fd, 0, SEEK_SET);
+    ssize_t r = read(fd, buf, sizeof(buf) - 1);
+    if (r > 0) cnt = atoi(buf);
+
+    char out[64];
+    int n = snprintf(out, sizeof(out), "%d\n", cnt + 1);
+
+    if (ftruncate(fd, 0) < 0) {
+        perror("ftruncate");
+    }
+    lseek(fd, 0, SEEK_SET);
+    if (write_all(fd, out, (size_t)n) < 0) {
+        perror("write refcount");
+    }
+    fsync(fd);
+
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 static void make_manifest_path(const char *cid, char out[PATH_MAX]) {
@@ -247,6 +267,7 @@ typedef struct {
     int pending_tasks;
     pthread_mutex_t mu;
     pthread_cond_t  cv;
+    int had_error;
 } UploadState;
 
 static void upload_state_construct(UploadState *st) {
@@ -271,6 +292,7 @@ static void upload_state_reset(UploadState *st) {
     st->next_index   = 0;
     st->total_chunks = 0;
     st->pending_tasks = 0;
+    st->had_error = 0;
     pthread_mutex_unlock(&st->mu);
 }
 
@@ -375,24 +397,24 @@ static void process_upload_task(Task *t) {
     char path[PATH_MAX];
     make_block_path(hash_hex, path);
 
-    // چک کن بلاک از قبل وجود دارد یا نه
-    int existed = 0;
+    int write_ok = 1;
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
-        // already exists
-        existed = 1;
         close(fd);
     } else {
-        // اگر وجود نداشت، فایل بلاک را اتمیک بنویس
         if (write_file_atomic(path, data, len) < 0) {
             fprintf(stderr, "Failed to write block %s\n", path);
-            // حتی اگر نوشتن بلاک fail شود، هنوز هم می‌توانیم manifest بسازیم،
-            // ولی در عمل بهتر است بعداً این را به ERROR تبدیل کنیم.
+            write_ok = 0;
         }
     }
 
-    // در هر دو حالت، refcount را زیاد کن
-    inc_refcount(hash_hex);
+    if (!write_ok) {
+        pthread_mutex_lock(&st->mu);
+        st->had_error = 1;
+        pthread_mutex_unlock(&st->mu);
+    } else {
+        inc_refcount(hash_hex);
+    }
 
     // Store chunk metadata in UploadState
     pthread_mutex_lock(&st->mu);
@@ -606,7 +628,33 @@ static void manifest_chunks_free(ManifestChunks *m) {
     m->n_chunks = 0;
 }
 
-// Very shallow parser for our own manifest format
+// JSON field extraction helpers for manifest parsing
+static int json_expect_int(const char *buf, const char *key, uint64_t *out) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    char *p = strstr(buf, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    *out = strtoull(p, NULL, 10);
+    return 0;
+}
+
+static int json_expect_string(const char *buf, const char *key,
+                              char *out, size_t out_sz) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    char *p = strstr(buf, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    char *end = strchr(p, '\"');
+    if (!end) return -1;
+    size_t n = (size_t)(end - p);
+    if (n >= out_sz) return -1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 0;
+}
+
 static int load_manifest_chunks(const char *cid, ManifestChunks *out) {
     char path[PATH_MAX];
     make_manifest_path(cid, path);
@@ -618,14 +666,13 @@ static int load_manifest_chunks(const char *cid, ManifestChunks *out) {
     }
 
     off_t size = lseek(fd, 0, SEEK_END);
-    if (size < 0) { perror("lseek"); close(fd); return -1; }
-    if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek"); close(fd); return -1; }
+    if (size <= 0) { close(fd); return -1; }
+    lseek(fd, 0, SEEK_SET);
 
     char *buf = malloc((size_t)size + 1);
-    if (!buf) { perror("malloc manifest"); close(fd); return -1; }
+    if (!buf) { close(fd); return -1; }
 
     if (read_n(fd, buf, (size_t)size) != size) {
-        perror("read manifest");
         close(fd);
         free(buf);
         return -1;
@@ -633,45 +680,65 @@ static int load_manifest_chunks(const char *cid, ManifestChunks *out) {
     close(fd);
     buf[size] = '\0';
 
-    const char *needle = "\"hash\":\"";
-    char *p = buf;
-    ChunkMeta *chunks = NULL;
-    size_t cap = 0, len_chunks = 0;
+    uint64_t version = 0, chunk_size = 0;
+    char algo[32];
 
-    while ((p = strstr(p, needle)) != NULL) {
-        p += strlen(needle);
+    if (json_expect_int(buf, "version", &version) < 0 ||
+        json_expect_int(buf, "chunk_size", &chunk_size) < 0 ||
+        json_expect_string(buf, "hash_algo", algo, sizeof(algo)) < 0) {
+        free(buf);
+        return -1;
+    }
+
+    if (version != 1 || chunk_size != DEFAULT_CHUNK_SIZE ||
+        strcmp(algo, "blake3") != 0) {
+        free(buf);
+        return -1;
+    }
+
+    char *chunks_arr = strstr(buf, "\"chunks\":[");
+    if (!chunks_arr) {
+        free(buf);
+        return -1;
+    }
+
+    char *p = chunks_arr;
+    ChunkMeta *chunks = NULL;
+    size_t cap = 0, n = 0;
+
+    while ((p = strstr(p, "\"hash\":\"")) != NULL) {
+        p += 8;
         char *end = strchr(p, '\"');
         if (!end) break;
-        size_t hlen = (size_t)(end - p);
-        if (hlen >= 64) hlen = 64;
 
-        if (len_chunks == cap) {
-            size_t new_cap = cap ? cap * 2 : 16;
-            ChunkMeta *n = realloc(chunks, new_cap * sizeof(ChunkMeta));
-            if (!n) {
-                perror("realloc manifest chunks");
-                free(chunks);
-                free(buf);
-                return -1;
-            }
-            chunks = n;
-            cap = new_cap;
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            ChunkMeta *tmp = realloc(chunks, nc * sizeof(ChunkMeta));
+            if (!tmp) { free(chunks); free(buf); return -1; }
+            chunks = tmp;
+            cap = nc;
         }
 
-        ChunkMeta *cm = &chunks[len_chunks];
-        cm->index = (uint32_t)len_chunks;
+        ChunkMeta *cm = &chunks[n];
+        cm->index = (uint32_t)n;
         cm->size  = 0;
-        memset(cm->hash, 0, sizeof(cm->hash));
-        memcpy(cm->hash, p, hlen);
-        cm->hash[hlen] = '\0';
+        size_t hlen = (size_t)(end - p);
+        if (hlen != 64) { free(chunks); free(buf); return -1; }
+        memcpy(cm->hash, p, 64);
+        cm->hash[64] = '\0';
 
-        len_chunks++;
+        n++;
         p = end + 1;
     }
 
     free(buf);
 
-    out->n_chunks = len_chunks;
+    if (n == 0) {
+        free(chunks);
+        return -1;
+    }
+
+    out->n_chunks = n;
     out->chunks   = chunks;
     return 0;
 }
@@ -717,6 +784,11 @@ static void handle_connection(int cfd) {
         memcpy(&len, header + 1, 4);
         len = ntohl(len);
 
+        if (len > MAX_FRAME) {
+            send_error(cfd, "E_PROTO", "frame too large");
+            break;
+        }
+
         uint8_t *payload = NULL;
         if (len) {
             payload = (uint8_t*)malloc(len);
@@ -737,6 +809,12 @@ static void handle_connection(int cfd) {
             upload_state_reset(&up);
             pthread_mutex_lock(&up.mu);
             up.active = 1;
+            if (len == 0 || len > MAX_NAME_LEN) {
+                send_error(cfd, "E_PROTO", "invalid filename length");
+                free(payload);
+                pthread_mutex_unlock(&up.mu);
+                break;
+            }
             up.filename = (char*)malloc(len + 1);
             if (!up.filename) {
                 perror("malloc filename");
@@ -773,6 +851,16 @@ static void handle_connection(int cfd) {
     }
     up.active = 0;
     pthread_mutex_unlock(&up.mu);
+
+    pthread_mutex_lock(&up.mu);
+    int had_error = up.had_error;
+    pthread_mutex_unlock(&up.mu);
+
+    if (had_error) {
+        send_error(cfd, "E_BUSY", "upload failed: storage error");
+        upload_state_reset(&up);
+        break;
+    }
 
     // ✅ کد جدید: چک کن هیچ چانکی جا نیفتاده
     int missing = 0;
@@ -826,6 +914,11 @@ static void handle_connection(int cfd) {
     upload_state_reset(&up);
 
         } else if (op == OP_DOWNLOAD_START) {
+            if (len == 0 || len > MAX_NAME_LEN) {
+                send_error(cfd, "E_PROTO", "invalid cid length");
+                free(payload);
+                break;
+            }
             char *cid = (char*)malloc(len + 1);
             if (!cid) {
                 perror("malloc cid");
@@ -928,6 +1021,7 @@ if (!any_error) {
     }
 
     upload_state_destroy(&up);
+    sem_post(&conn_sem);
     close(cfd);
 }
 
@@ -951,6 +1045,8 @@ int main(int argc, char** argv) {
         pthread_detach(th);
     }
 
+    sem_init(&conn_sem, 0, MAX_CONNECTIONS);
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) die("socket");
 
@@ -967,8 +1063,10 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     for (;;) {
+        sem_wait(&conn_sem);
         int cfd = accept(fd, NULL, NULL);
         if (cfd < 0) {
+            sem_post(&conn_sem);
             if (errno == EINTR) continue;
             perror("accept");
             break;
