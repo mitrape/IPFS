@@ -25,7 +25,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 
-#include "blake3.h"   // requires libblake3
+#include "blake3/blake3.h"  // requires libblake3
 
 #define OP_UPLOAD_START   0x01
 #define OP_UPLOAD_CHUNK   0x02
