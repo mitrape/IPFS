@@ -96,10 +96,13 @@ int send_frame(int fd, uint8_t op, const void* payload, uint32_t len) {
 /* send error*/
 static void send_error(int fd, const char *code, const char *msg) {
     char buf[256];
-    int n = snprintf(buf,sizeof(buf),
-            "{\"code\":\"%s\",\"message\":\"%s\"}", code, msg);
-    send_frame(fd, OP_ERROR, buf, n);
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"code\":\"%s\",\"message\":\"%s\"}", code, msg);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1; // clamp
+    send_frame(fd, OP_ERROR, buf, (uint32_t)n);
 }
+
 
 /* ==================== FS helpers ==================== */
 
@@ -373,7 +376,7 @@ static void process_upload_task(Task *t) {
     make_block_path(hash_hex, path);
 
     // چک کن بلاک از قبل وجود دارد یا نه
-    
+    int existed = 0;
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         // already exists
