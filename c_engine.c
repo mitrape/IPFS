@@ -1,12 +1,3 @@
-// Build: gcc -O2 -pthread -o c_engine c_engine.c -lblake3
-// Run:   ./c_engine /tmp/cengine.sock
-//
-// Storage layout (relative to cwd):
-//   ipfs_store/blocks/<h0h1>/<h2h3>/<fullhash>.bin
-//   ipfs_store/manifests/<cid>.json
-//
-// Hash:  BLAKE3 (32 bytes, hex-encoded)
-// Chunk: 256 KiB (must match main.py)
 #define _GNU_SOURCE
 #include <semaphore.h>
 #define MAX_CONNECTIONS 64
@@ -28,14 +19,13 @@ static sem_t conn_sem;
 #include <inttypes.h>
 #include <sys/file.h>
 
-#include "blake3/blake3.h"   // requires libblake3
+#include "blake3/blake3.h"
 
 #define OP_UPLOAD_START   0x01
 #define OP_UPLOAD_CHUNK   0x02
 #define OP_UPLOAD_FINISH  0x03
 #define OP_UPLOAD_DONE    0x81
 
-// must match main.py
 #define OP_DOWNLOAD_START 0x11
 #define OP_DOWNLOAD_CHUNK 0x91
 #define OP_DOWNLOAD_DONE  0x92
@@ -48,13 +38,12 @@ static sem_t conn_sem;
 
 #define NUM_WORKERS 4
 
-#define MAX_FRAME (4 * 1024 * 1024)  // 4 MiB safety cap
+#define MAX_FRAME (4 * 1024 * 1024)
 #define MAX_NAME_LEN 4096
 
 
 static const char* g_sock_path = NULL;
 
-// CID in this project is a 64-char hex-encoded BLAKE3 digest (not IPFS multibase/multihash).
 static int is_hex_char(unsigned char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
@@ -67,7 +56,6 @@ static int is_valid_cid_hex(const uint8_t *s, uint32_t len) {
     return 1;
 }
 
-/* ==================== I/O helpers ==================== */
 
 static void die(const char *msg) {
     perror(msg);
@@ -119,12 +107,11 @@ static void send_error(int fd, const char *code, const char *msg) {
     int n = snprintf(buf, sizeof(buf),
                      "{\"code\":\"%s\",\"message\":\"%s\"}", code, msg);
     if (n < 0) return;
-    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1; // clamp
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
     send_frame(fd, OP_ERROR, buf, (uint32_t)n);
 }
 
 
-/* ==================== FS helpers ==================== */
 
 static int ensure_dir(const char *path) {
     if (mkdir(path, 0777) == 0) return 0;
@@ -183,7 +170,6 @@ static int write_file_atomic(const char *path, const void *data, size_t len) {
     return 0;
 }
 
-/* ==================== BLAKE3 hashing ==================== */
 
 static void blake3_hex(const uint8_t *data, size_t len, char out_hex[65]) {
     uint8_t out_bytes[BLAKE3_OUT_LEN];
@@ -198,21 +184,18 @@ static void blake3_hex(const uint8_t *data, size_t len, char out_hex[65]) {
     out_hex[2 * BLAKE3_OUT_LEN] = '\0';
 }
 
-/* ==================== Paths for blocks/manifests ==================== */
 
 static void make_block_path(const char *hash_hex, char out[PATH_MAX]) {
     char d1[3] = { hash_hex[0], hash_hex[1], '\0' };
     char d2[3] = { hash_hex[2], hash_hex[3], '\0' };
     snprintf(out, PATH_MAX, "%s/%s/%s/%s.bin", BLOCKS_DIR, d1, d2, hash_hex);
 }
-// مسیر فایل refcount برای هر بلاک: ipfs_store/blocks/aa/bb/<hash>.ref
 static void make_refcount_path(const char *hash_hex, char out[PATH_MAX]) {
     char d1[3] = { hash_hex[0], hash_hex[1], '\0' };
     char d2[3] = { hash_hex[2], hash_hex[3], '\0' };
     snprintf(out, PATH_MAX, "%s/%s/%s/%s.ref", BLOCKS_DIR, d1, d2, hash_hex);
 }
 
-// افزایش refcount برای بلاک با این hash
 static void inc_refcount(const char *hash_hex) {
     char refpath[PATH_MAX];
     make_refcount_path(hash_hex, refpath);
@@ -260,7 +243,6 @@ static void make_manifest_path(const char *cid, char out[PATH_MAX]) {
     snprintf(out, PATH_MAX, "%s/%s.json", MANIFESTS_DIR, cid);
 }
 
-/* ==================== Upload state ==================== */
 
 typedef struct {
     uint32_t index;
@@ -316,7 +298,6 @@ static void upload_state_destroy(UploadState *st) {
     pthread_cond_destroy(&st->cv);
 }
 
-/* ==================== Download state ==================== */
 
 typedef struct {
     uint8_t *data;
@@ -353,7 +334,6 @@ static void download_state_destroy(DownloadState *ds) {
     pthread_cond_destroy(&ds->cv);
 }
 
-/* ==================== Thread pool & tasks ==================== */
 
 typedef enum {
     TASK_UPLOAD,
@@ -396,7 +376,6 @@ static void enqueue_task(Task *t) {
     pthread_mutex_unlock(&q_mu);
 }
 
-/* -------- upload task processing -------- */
 
 static void process_upload_task(Task *t) {
     UploadState *st  = t->u.upload.st;
@@ -407,7 +386,6 @@ static void process_upload_task(Task *t) {
     char hash_hex[65];
     blake3_hex(data, len, hash_hex);
 
-    // Store block (content-addressed)
     char path[PATH_MAX];
     make_block_path(hash_hex, path);
 
@@ -430,7 +408,6 @@ static void process_upload_task(Task *t) {
         inc_refcount(hash_hex);
     }
 
-    // Store chunk metadata in UploadState
     pthread_mutex_lock(&st->mu);
 
     if (index >= st->chunks_cap) {
@@ -457,11 +434,10 @@ static void process_upload_task(Task *t) {
     pthread_cond_broadcast(&st->cv);
     pthread_mutex_unlock(&st->mu);
 
-    free(data);  // chunk buffer owned by task
+    free(data);
 }
 
 
-/* -------- download task processing -------- */
 
 static void process_download_task(Task *t) {
     DownloadState *ds = t->u.download.st;
@@ -477,7 +453,7 @@ static void process_download_task(Task *t) {
         pthread_mutex_lock(&ds->mu);
         if (index < ds->n_chunks) {
             ds->slots[index].ready = 1;
-            ds->slots[index].error = 1;  // 1 = "chunk not found or I/O error"
+            ds->slots[index].error = 1;
         }
         pthread_cond_broadcast(&ds->cv);
         pthread_mutex_unlock(&ds->mu);
@@ -548,21 +524,20 @@ static void process_download_task(Task *t) {
     if (index < ds->n_chunks) {
         ds->slots[index].ready = 1;
         if (mismatch) {
-            ds->slots[index].error = 2;  // 2 = HASH_MISMATCH
+            ds->slots[index].error = 2;
         } else {
             ds->slots[index].error = 0;
             ds->slots[index].data  = buf;
             ds->slots[index].size  = (uint32_t)sz;
-            buf = NULL; // ownership moved
+            buf = NULL;
         }
     }
     pthread_cond_broadcast(&ds->cv);
     pthread_mutex_unlock(&ds->mu);
 
-    free(buf); // free only if not moved
+    free(buf);
 }
 
-/* -------- worker thread -------- */
 
 static void* worker_main(void *arg) {
     (void)arg;
@@ -585,7 +560,6 @@ static void* worker_main(void *arg) {
     }
     return NULL;
 }
-/* ==================== Manifest building/parsing ==================== */
 
 static int build_manifest_json(const UploadState *st,
                                char **out_buf, size_t *out_len,
@@ -599,7 +573,7 @@ static int build_manifest_json(const UploadState *st,
         return -1;
     }
 
-    pthread_mutex_lock((pthread_mutex_t *)&st->mu); // const-cast for read
+    pthread_mutex_lock((pthread_mutex_t *)&st->mu);
     uint32_t total_chunks = st->total_chunks;
     uint64_t total_size   = st->total_size;
 
@@ -632,7 +606,7 @@ static int build_manifest_json(const UploadState *st,
 
 typedef struct {
     size_t n_chunks;
-    ChunkMeta *chunks;   // only hash+index used
+    ChunkMeta *chunks;
 } ManifestChunks;
 
 static void manifest_chunks_free(ManifestChunks *m) {
@@ -642,7 +616,6 @@ static void manifest_chunks_free(ManifestChunks *m) {
     m->n_chunks = 0;
 }
 
-// JSON field extraction helpers for manifest parsing
 static int json_expect_int(const char *buf, const char *key, uint64_t *out) {
     char needle[64];
     snprintf(needle, sizeof(needle), "\"%s\":", key);
@@ -757,7 +730,6 @@ static int load_manifest_chunks(const char *cid, ManifestChunks *out) {
     return 0;
 }
 
-/* ==================== Connection handler ==================== */
 
 static int queue_upload_chunk(UploadState *st, uint8_t *data, uint32_t len) {
     Task *t = (Task*)calloc(1, sizeof(Task));
@@ -851,14 +823,13 @@ static void handle_connection(int cfd) {
             free(payload);
             break;
         }
-        free_payload = 0; // task owns payload
+        free_payload = 0;
     }
 
         } else if (op == OP_UPLOAD_FINISH) {
     printf("[ENGINE] UPLOAD_FINISH\n");
     fflush(stdout);
 
-    // صبر کن تا همه‌ی تسک‌های آپلود تموم بشن
     pthread_mutex_lock(&up.mu);
     while (up.pending_tasks > 0) {
         pthread_cond_wait(&up.cv, &up.mu);
@@ -876,11 +847,9 @@ static void handle_connection(int cfd) {
         break;
     }
 
-    // ✅ کد جدید: چک کن هیچ چانکی جا نیفتاده
     int missing = 0;
     pthread_mutex_lock(&up.mu);
     for (uint32_t i = 0; i < up.total_chunks; i++) {
-        // اگر ظرفیت آرایه به هر دلیل کمتر باشه، یا size صفر باشه → مشکل
         if (i >= up.chunks_cap || up.chunks[i].size == 0) {
             missing = 1;
             break;
@@ -896,7 +865,6 @@ static void handle_connection(int cfd) {
         break;
     }
 
-    // از اینجا به بعد مثل قبل
     char *manifest = NULL;
     size_t manifest_len = 0;
     char cid[65];
@@ -928,7 +896,6 @@ static void handle_connection(int cfd) {
     upload_state_reset(&up);
 
         } else if (op == OP_DOWNLOAD_START) {
-            // Validate CID syntax: our CID is a 64-hex digest.
             if (!is_valid_cid_hex(payload, len)) {
                 send_error(cfd, "E_BAD_CID", "invalid cid");
                 free(payload);
@@ -961,7 +928,6 @@ static void handle_connection(int cfd) {
             DownloadState ds;
             download_state_construct(&ds, m.n_chunks);
 
-            // create tasks for each chunk
             for (size_t i = 0; i < m.n_chunks; i++) {
                 Task *t = (Task*)calloc(1, sizeof(Task));
                 if (!t) {
@@ -981,7 +947,6 @@ static void handle_connection(int cfd) {
 
             int any_error = 0;
 
-// sequential merger: wait index by index
 for (size_t i = 0; i < m.n_chunks; i++) {
     pthread_mutex_lock(&ds.mu);
     while (!ds.slots[i].ready) {
@@ -1040,7 +1005,6 @@ if (!any_error) {
     close(cfd);
 }
 
-/* ==================== main ==================== */
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -1053,7 +1017,7 @@ int main(int argc, char** argv) {
     if (ensure_dir(BLOCKS_DIR) < 0) return 1;
     if (ensure_dir(MANIFESTS_DIR) < 0) return 1;
 
-    // start global thread pool
+    
     for (int i = 0; i < NUM_WORKERS; i++) {
         pthread_t th;
         pthread_create(&th, NULL, worker_main, NULL);
@@ -1096,7 +1060,3 @@ int main(int argc, char** argv) {
     unlink(g_sock_path);
     return 0;
 }
-
-
-
-
