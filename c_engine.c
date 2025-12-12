@@ -51,7 +51,21 @@ static sem_t conn_sem;
 #define MAX_FRAME (4 * 1024 * 1024)  // 4 MiB safety cap
 #define MAX_NAME_LEN 4096
 
+
 static const char* g_sock_path = NULL;
+
+// CID in this project is a 64-char hex-encoded BLAKE3 digest (not IPFS multibase/multihash).
+static int is_hex_char(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int is_valid_cid_hex(const uint8_t *s, uint32_t len) {
+    if (len != 64) return 0;
+    for (uint32_t i = 0; i < len; i++) {
+        if (!is_hex_char((unsigned char)s[i])) return 0;
+    }
+    return 1;
+}
 
 /* ==================== I/O helpers ==================== */
 
@@ -914,8 +928,9 @@ static void handle_connection(int cfd) {
     upload_state_reset(&up);
 
         } else if (op == OP_DOWNLOAD_START) {
-            if (len == 0 || len > MAX_NAME_LEN) {
-                send_error(cfd, "E_PROTO", "invalid cid length");
+            // Validate CID syntax: our CID is a 64-hex digest.
+            if (!is_valid_cid_hex(payload, len)) {
+                send_error(cfd, "E_BAD_CID", "invalid cid");
                 free(payload);
                 break;
             }
